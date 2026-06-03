@@ -1,5 +1,6 @@
 import { FastifyPluginAsync } from "fastify";
 import { CDPService } from "../services/cdp/cdp.service.js";
+import { OdooAutoLoginPlugin } from "../services/cdp/plugins/odoo-autologin.plugin.js";
 import fp from "fastify-plugin";
 import { BrowserLauncherOptions } from "../types/index.js";
 import {
@@ -53,6 +54,10 @@ const browserInstancePlugin: FastifyPluginAsync = async (fastify, _options) => {
   }
 
   const cdpService = new CDPService({}, fastify.log, storage, enableConsoleLogging);
+
+  // ledoent: auto-login each session into the in-cluster Odoo. No-op unless
+  // STEEL_ODOO_AUTOLOGIN=true. See deployments/openupgrade-lab/steel-plugin/.
+  cdpService.registerPlugin(new OdooAutoLoginPlugin());
 
   fastify.decorate("cdpService", cdpService);
   fastify.decorate(

@@ -49,23 +49,29 @@ export class OdooAutoLoginPlugin extends BasePlugin {
     }
   }
 
-  // onBrowserReady fires after Chrome is up + the primary page refreshed. The
-  // hook gets only the launch config, so reach the live Page via the injected
-  // CDP service.
-  public override async onBrowserReady(): Promise<void> {
-    if (!this.cfg.enabled) return;
-    if (!this.cdpService) {
-      this.log("no cdpService bound — skipping");
-      return;
-    }
+  // onBrowserReady fires after Chrome is up + the primary page refreshed, and
+  // is AWAITED inside steel's launch path — which is bounded by a 60s
+  // LaunchTimeoutError (cdp.service.ts). A full Odoo login is several
+  // navigations and can exceed that, which would abort session creation (and
+  // even the idle boot browser). So fire-and-forget: return immediately and run
+  // the login OFF the critical path. The session is created right away; the
+  // page becomes authenticated a moment later.
+  public override onBrowserReady(): void {
+    if (!this.cfg.enabled || !this.cdpService) return;
+    void this.runLogin();
+  }
+
+  private async runLogin(): Promise<void> {
+    const cdp = this.cdpService;
+    if (!cdp) return;
     try {
-      const page = await this.cdpService.getPrimaryPage();
+      const page = await cdp.getPrimaryPage();
       await this.login(page);
       this.log(`logged in → ${page.url()}`);
     } catch (e) {
-      // Never abort session creation on a login failure — surface it and leave
-      // the browser on the login page for a human to inspect.
-      this.log(`auto-login FAILED: ${(e as Error).message}`, "warn");
+      // Background task — a failure (wrong creds/db, browser torn down) is
+      // logged and swallowed; it can't affect session creation.
+      this.log(`auto-login skipped/failed: ${(e as Error).message}`, "warn");
     }
   }
 

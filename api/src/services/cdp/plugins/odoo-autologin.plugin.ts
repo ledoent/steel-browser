@@ -1,88 +1,130 @@
 // Odoo auto-login plugin for steel-browser (ledoent).
 //
-// Logs the session's Chrome into the in-cluster Odoo at onBrowserReady, so
-// oca-review / oca-ux browser passes and the demo viewer land on an
-// authenticated backend instead of each re-running a login dance. Mirrors the
-// proven selectors + gotchas from ws3-harness/driver.mjs odooLogin().
+// Pre-authenticates a session's Chrome into the in-cluster Odoo so the live
+// view / agent lands on the backend. Identity is PER SESSION — there is no
+// pod-level super-user default. Each consumer has its own role/login.
 //
-// No-op unless STEEL_ODOO_AUTOLOGIN=true. Config (read once at construction):
-//   STEEL_ODOO_AUTOLOGIN   "true" to arm (default off)
-//   STEEL_ODOO_BASE        e.g. http://odoo-19:8069
-//   STEEL_ODOO_DB          target db (multi-db host needs this)
-//   STEEL_ODOO_LOGIN       default "admin"
-//   STEEL_ODOO_PASSWORD    default "admin"
+// Where creds come from, in priority order:
+//   1. Per-session, set by the caller in POST /v1/sessions:
+//        { "userPreferences": { "odoo": {
+//            "db": "<db>", "login": "<user>", "password": "<pw>",
+//            "base": "http://odoo-19:8069"   // optional; defaults to STEEL_ODOO_BASE
+//        } } }
+//      → logs in as THAT identity (the agent's own role).
+//   2. Demo fallback (human/demo viewer opening a session with no creds):
+//        STEEL_ODOO_DEMO_DB / STEEL_ODOO_DEMO_LOGIN / STEEL_ODOO_DEMO_PASSWORD
+//      → a single, narrow demo identity. Leave unset to disable the fallback.
+//   3. Neither → NO-OP. We never log in as a guessed/default identity.
+//
+// Master switch: STEEL_ODOO_AUTOLOGIN=true (else the whole plugin no-ops).
+// Default base for per-session creds that omit `base`: STEEL_ODOO_BASE.
+//
+// onBrowserReady is awaited inside steel's 60s-bounded launch path, so the
+// login runs fire-and-forget (off the critical path) — it can never block or
+// fail session creation. Mirrors ws3-harness/driver.mjs odooLogin().
 
 import type { Page } from "puppeteer-core";
-import { BasePlugin, PluginOptions } from "./core/base-plugin.js";
+import { BasePlugin, PluginOptions, BrowserLauncherOptions } from "./core/base-plugin.js";
 
-interface OdooConfig {
-  enabled: boolean;
+interface OdooCreds {
   base: string;
   db: string;
   login: string;
   password: string;
+  source: "session" | "demo";
 }
 
-function readConfig(): OdooConfig {
+interface PluginCfg {
+  enabled: boolean;
+  defaultBase: string;
+  demo: { base: string; db: string; login: string; password: string } | null;
+}
+
+function readCfg(): PluginCfg {
+  const defaultBase = process.env.STEEL_ODOO_BASE || "http://odoo-19:8069";
+  const dLogin = process.env.STEEL_ODOO_DEMO_LOGIN;
+  const dPass = process.env.STEEL_ODOO_DEMO_PASSWORD;
+  const demo =
+    dLogin && dPass
+      ? {
+          base: process.env.STEEL_ODOO_DEMO_BASE || defaultBase,
+          db: process.env.STEEL_ODOO_DEMO_DB || "",
+          login: dLogin,
+          password: dPass,
+        }
+      : null;
   return {
     enabled: process.env.STEEL_ODOO_AUTOLOGIN === "true",
-    base: process.env.STEEL_ODOO_BASE || "http://odoo-19:8069",
-    db: process.env.STEEL_ODOO_DB || "",
-    login: process.env.STEEL_ODOO_LOGIN || "admin",
-    password: process.env.STEEL_ODOO_PASSWORD || "admin",
+    defaultBase,
+    demo,
   };
 }
 
 export class OdooAutoLoginPlugin extends BasePlugin {
-  private cfg: OdooConfig;
-  // Set by onSessionStart (real sessions only), consumed by the next
-  // onBrowserReady. The idle default boot browser launches WITHOUT an
-  // onSessionStart, so it never triggers a login — its primary page churns and
-  // would only produce detached-frame noise.
-  private pendingLogin = false;
+  private cfg: PluginCfg;
+  // Resolved in onSessionStart (per session), consumed by the next
+  // onBrowserReady. null ⇒ this session does not auto-login.
+  private pending: OdooCreds | null = null;
 
   constructor(options: Partial<PluginOptions> = {}) {
     super({ name: "odoo-autologin", ...options });
-    this.cfg = readConfig();
+    this.cfg = readCfg();
   }
 
-  // onSessionStart fires BEFORE the browser launches (no Page yet), and ONLY
-  // for real sessions (POST /v1/sessions) — not the idle boot browser. Arm the
-  // login for the onBrowserReady that follows.
-  public override onSessionStart(): void {
+  // Resolve the identity for THIS session: caller-supplied creds first, demo
+  // fallback second, otherwise none. No super-user default.
+  private resolve(sessionConfig?: BrowserLauncherOptions): OdooCreds | null {
+    const s = (sessionConfig?.userPreferences as Record<string, any> | undefined)?.odoo as
+      | Record<string, string>
+      | undefined;
+    if (s && s.login && s.password) {
+      return {
+        base: s.base || this.cfg.defaultBase,
+        db: s.db || "",
+        login: s.login,
+        password: s.password,
+        source: "session",
+      };
+    }
+    if (this.cfg.demo) {
+      return { ...this.cfg.demo, source: "demo" };
+    }
+    return null;
+  }
+
+  // onSessionStart fires BEFORE launch and ONLY for real sessions (POST
+  // /v1/sessions) — not the idle boot browser. Resolve+arm the identity here.
+  public override onSessionStart(sessionConfig: BrowserLauncherOptions): void {
     if (!this.cfg.enabled) return;
-    this.pendingLogin = true;
-    this.log(`armed for ${this.cfg.base} (db=${this.cfg.db || "<none>"})`);
+    this.pending = this.resolve(sessionConfig);
+    if (this.pending) {
+      this.log(
+        `armed (${this.pending.source}) → ${this.pending.login}@${this.pending.base} db=${this.pending.db || "<none>"}`,
+      );
+    } else {
+      this.log("no per-session creds and no demo fallback — not logging in");
+    }
   }
 
-  // onBrowserReady fires after Chrome is up + the primary page refreshed, and
-  // is AWAITED inside steel's launch path — which is bounded by a 60s
-  // LaunchTimeoutError (cdp.service.ts). A full Odoo login is several
-  // navigations and can exceed that, which would abort session creation (and
-  // even the idle boot browser). So fire-and-forget: return immediately and run
-  // the login OFF the critical path. The session is created right away; the
-  // page becomes authenticated a moment later.
   public override onBrowserReady(): void {
-    // Only auto-login real sessions (armed by onSessionStart); skip the idle
-    // boot browser. Fire-and-forget — onBrowserReady is awaited in steel's
-    // 60s-bounded launch path, so we must NOT block it.
-    if (!this.cfg.enabled || !this.cdpService || !this.pendingLogin) return;
-    this.pendingLogin = false;
-    void this.runLogin();
+    // Fire-and-forget: do NOT block the 60s-bounded launch path.
+    if (!this.cfg.enabled || !this.cdpService || !this.pending) return;
+    const creds = this.pending;
+    this.pending = null;
+    void this.runLogin(creds);
   }
 
-  private async runLogin(): Promise<void> {
+  private async runLogin(creds: OdooCreds): Promise<void> {
     const cdp = this.cdpService;
     if (!cdp) return;
-    // Let steel finish wiring the session's primary page before we drive it —
-    // it refreshes/replaces the primary target right after ready, which
-    // detaches a page grabbed too eagerly.
+    // Let steel finish wiring the session's primary page (it refreshes the
+    // primary target right after ready; a page grabbed too eagerly detaches).
     await this.sleep(1500);
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const page = await cdp.getPrimaryPage();
-        await this.login(page);
-        this.log(`logged in → ${page.url()}`);
+        await this.login(page, creds);
+        this.log(`logged in (${creds.source}) → ${page.url()}`);
         return;
       } catch (e) {
         const msg = (e as Error).message;
@@ -100,12 +142,8 @@ export class OdooAutoLoginPlugin extends BasePlugin {
     }
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  private async login(page: Page): Promise<void> {
-    const { base, db, login, password } = this.cfg;
+  private async login(page: Page, creds: OdooCreds): Promise<void> {
+    const { base, db, login, password } = creds;
     const loginUrl = db
       ? `${base}/web/login?db=${encodeURIComponent(db)}`
       : `${base}/web/login`;
@@ -141,7 +179,6 @@ export class OdooAutoLoginPlugin extends BasePlugin {
       .catch(() => null);
     await page.waitForSelector(".o_main_navbar, .o_web_client", { timeout: 60000 });
 
-    // Surface wrong-credentials loudly instead of returning a half-state.
     if (/\/web\/login/.test(page.url())) {
       const err = await page
         .$eval(".alert-danger, .o_login_invalid", (el) => el.textContent || "")
@@ -151,19 +188,16 @@ export class OdooAutoLoginPlugin extends BasePlugin {
   }
 
   private async clickSubmit(page: Page): Promise<void> {
-    // Odoo's login submit is a btn-primary submit button; try the robust
-    // selectors in order. (Avoid page.evaluate/document so the build doesn't
-    // need the DOM lib in tsconfig.)
-    for (const sel of [
-      'button[type="submit"]',
-      ".oe_login_form button",
-      "button.btn-primary",
-    ]) {
+    for (const sel of ['button[type="submit"]', ".oe_login_form button", "button.btn-primary"]) {
       if (await page.$(sel)) {
         await page.click(sel).catch(() => undefined);
         return;
       }
     }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private log(msg: string, level: "info" | "warn" = "info"): void {

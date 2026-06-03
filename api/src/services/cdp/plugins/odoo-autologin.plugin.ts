@@ -35,18 +35,24 @@ function readConfig(): OdooConfig {
 
 export class OdooAutoLoginPlugin extends BasePlugin {
   private cfg: OdooConfig;
+  // Set by onSessionStart (real sessions only), consumed by the next
+  // onBrowserReady. The idle default boot browser launches WITHOUT an
+  // onSessionStart, so it never triggers a login — its primary page churns and
+  // would only produce detached-frame noise.
+  private pendingLogin = false;
 
   constructor(options: Partial<PluginOptions> = {}) {
     super({ name: "odoo-autologin", ...options });
     this.cfg = readConfig();
   }
 
-  // onSessionStart fires BEFORE the browser launches (no Page yet) — announce
-  // intent only.
+  // onSessionStart fires BEFORE the browser launches (no Page yet), and ONLY
+  // for real sessions (POST /v1/sessions) — not the idle boot browser. Arm the
+  // login for the onBrowserReady that follows.
   public override onSessionStart(): void {
-    if (this.cfg.enabled) {
-      this.log(`armed for ${this.cfg.base} (db=${this.cfg.db || "<none>"})`);
-    }
+    if (!this.cfg.enabled) return;
+    this.pendingLogin = true;
+    this.log(`armed for ${this.cfg.base} (db=${this.cfg.db || "<none>"})`);
   }
 
   // onBrowserReady fires after Chrome is up + the primary page refreshed, and
@@ -57,22 +63,45 @@ export class OdooAutoLoginPlugin extends BasePlugin {
   // the login OFF the critical path. The session is created right away; the
   // page becomes authenticated a moment later.
   public override onBrowserReady(): void {
-    if (!this.cfg.enabled || !this.cdpService) return;
+    // Only auto-login real sessions (armed by onSessionStart); skip the idle
+    // boot browser. Fire-and-forget — onBrowserReady is awaited in steel's
+    // 60s-bounded launch path, so we must NOT block it.
+    if (!this.cfg.enabled || !this.cdpService || !this.pendingLogin) return;
+    this.pendingLogin = false;
     void this.runLogin();
   }
 
   private async runLogin(): Promise<void> {
     const cdp = this.cdpService;
     if (!cdp) return;
-    try {
-      const page = await cdp.getPrimaryPage();
-      await this.login(page);
-      this.log(`logged in → ${page.url()}`);
-    } catch (e) {
-      // Background task — a failure (wrong creds/db, browser torn down) is
-      // logged and swallowed; it can't affect session creation.
-      this.log(`auto-login skipped/failed: ${(e as Error).message}`, "warn");
+    // Let steel finish wiring the session's primary page before we drive it —
+    // it refreshes/replaces the primary target right after ready, which
+    // detaches a page grabbed too eagerly.
+    await this.sleep(1500);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const page = await cdp.getPrimaryPage();
+        await this.login(page);
+        this.log(`logged in → ${page.url()}`);
+        return;
+      } catch (e) {
+        const msg = (e as Error).message;
+        const swap = /detached|Target closed|Session closed|Execution context|Cannot find context/i.test(msg);
+        if (attempt < 2 && swap) {
+          this.log(`attempt ${attempt} hit a page swap (${msg.slice(0, 60)}…); retrying`, "warn");
+          await this.sleep(2000);
+          continue;
+        }
+        // Background task — a failure (wrong creds/db, browser torn down) is
+        // logged and swallowed; it can't affect session creation.
+        this.log(`auto-login skipped/failed: ${msg}`, "warn");
+        return;
+      }
     }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private async login(page: Page): Promise<void> {

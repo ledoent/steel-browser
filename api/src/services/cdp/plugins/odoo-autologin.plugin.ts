@@ -151,27 +151,65 @@ export class OdooAutoLoginPlugin extends BasePlugin {
     // domcontentloaded, NOT networkidle — Odoo longpolls forever.
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Multi-db host (list_db=True, no dbfilter): ?db= alone doesn't bind on the
-    // website-themed page — select it explicitly so the POST carries it.
-    if (db && (await page.$('select[name="db"]'))) {
-      await page.select('select[name="db"]', db).catch(() => []);
-      await page
-        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 })
-        .catch(() => null);
+    // Wait for the login form to render (website-themed builds add it a beat
+    // after domcontentloaded).
+    const userSel = 'input[name="login"], input[type="email"]';
+    const userField = await page
+      .waitForSelector(userSel, { visible: true, timeout: 15000 })
+      .catch(() => null);
+    if (!userField) {
+      throw new Error("login form never appeared");
     }
 
-    const userSel = 'input[name="login"], input[type="email"]';
-    if (await page.$(userSel)) {
-      await page.type(userSel, login);
-      const pwSel = 'input[name="password"], input[type="password"]';
-      if (await page.$(pwSel)) await page.type(pwSel, password);
-      await Promise.all([
-        page
-          .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 })
-          .catch(() => null),
-        this.clickSubmit(page),
-      ]);
-    }
+    await page.type(userSel, login);
+    const pwH = await page.$('input[name="password"], input[type="password"]');
+    if (pwH) await pwH.type(password);
+
+    // Bind the db and submit the LOGIN form specifically. Two website-theme
+    // traps this avoids:
+    //   1. The db field is an <input name="db"> (text), not a <select>, and
+    //      ?db= doesn't reliably prefill it — set it explicitly.
+    //   2. The page has MULTIPLE <button type=submit> (the website search form's
+    //      precedes the login form's in the DOM), so clicking the first submit
+    //      on the page submits SEARCH, never the login → bounce back to /login.
+    //      Scope to the form that actually contains the login field.
+    const prep = await page
+      .evaluate((dbName) => {
+        const loginEl = document.querySelector('input[name="login"], input[type="email"]');
+        const form = (loginEl && loginEl.closest("form")) as HTMLFormElement | null;
+        if (!form) return "no-login-form";
+        if (dbName) {
+          const dbEl = form.querySelector('input[name="db"], select[name="db"]') as
+            | HTMLInputElement
+            | HTMLSelectElement
+            | null;
+          if (dbEl) {
+            (dbEl as HTMLInputElement).value = dbName;
+            dbEl.dispatchEvent(new Event("input", { bubbles: true }));
+            dbEl.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+        return "ok";
+      }, db)
+      .catch((e) => `err:${e}`);
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null),
+      page
+        .evaluate(() => {
+          const loginEl = document.querySelector('input[name="login"], input[type="email"]');
+          const form = (loginEl && loginEl.closest("form")) as HTMLFormElement | null;
+          if (!form) return;
+          const btn = form.querySelector('button[type="submit"], button:not([type])') as
+            | HTMLButtonElement
+            | null;
+          if (btn) btn.click();
+          else if (form.requestSubmit) form.requestSubmit();
+          else form.submit();
+        })
+        .catch(() => undefined),
+    ]);
+    this.log(`submitted login form (${prep})`);
 
     // Force the backend so we don't linger on a portal/website landing.
     await page
@@ -184,15 +222,6 @@ export class OdooAutoLoginPlugin extends BasePlugin {
         .$eval(".alert-danger, .o_login_invalid", (el) => el.textContent || "")
         .catch(() => "");
       throw new Error(`still on /web/login${err ? ": " + err.trim() : ""}`);
-    }
-  }
-
-  private async clickSubmit(page: Page): Promise<void> {
-    for (const sel of ['button[type="submit"]', ".oe_login_form button", "button.btn-primary"]) {
-      if (await page.$(sel)) {
-        await page.click(sel).catch(() => undefined);
-        return;
-      }
     }
   }
 
